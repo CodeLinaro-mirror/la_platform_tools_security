@@ -1,3 +1,7 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
 rust_bindgen {
     name: "libssl_bindgen",
     crate_name: "ssl_bindgen",
@@ -44,6 +48,21 @@ rust_test {
     test_options: {
         unit_test: false,
     },
+    rustlibs: [
+        "libcert_request_validator",
+        "libanyhow",
+        "libthiserror",
+        "libciborium",
+        "libcoset",
+        "libchrono",
+        "libssl_bindgen",
+    ],
+}
+
+rust_binary {
+    name: "bcc_validator",
+    srcs: ["src/bcc_main.rs"],
+    host_supported: true,
     rustlibs: [
         "libcert_request_validator",
         "libanyhow",
