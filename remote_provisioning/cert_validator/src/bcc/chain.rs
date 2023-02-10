@@ -1,82 +1,69 @@
 //! This module provides a wrapper describing a valid Boot Certificate Chain.
 
-use super::cose_error;
 use super::entry::Payload;
 use crate::publickey::PublicKey;
-use crate::value_from_bytes;
-use anyhow::{bail, ensure, Context, Result};
-use ciborium::value::Value;
-use coset::{cbor::value::Value::Array, AsCborValue, CoseKey};
+use anyhow::Result;
+use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
-
-/// Parse a series of BccEntry certificates, represented as CBOR Values, checking the public key of
-/// any given cert's payload in the series correctly signs the next, and verifying the payloads
-/// are well formed. If root_key is specified then it must be the key used to sign the first (root)
-/// certificate; otherwise that signature is not checked.
-fn check_sign1_chain<T: IntoIterator<Item = Value>>(
-    chain: T,
-    root_key: Option<&PublicKey>,
-) -> Result<Vec<Payload>> {
-    let values = chain.into_iter();
-    let mut payloads = Vec::<Payload>::with_capacity(values.size_hint().0);
-
-    let mut previous_public_key = root_key;
-    let mut expected_issuer: Option<&str> = None;
-
-    for (n, value) in values.enumerate() {
-        let payload = Payload::from_cbor_sign1(previous_public_key, expected_issuer, value)
-            .with_context(|| format!("Invalid BccPayload at index {}", n))?;
-        payloads.push(payload);
-
-        let previous = payloads.last().unwrap();
-        expected_issuer = Some(previous.subject.as_str());
-        previous_public_key = Some(&previous.subject_public_key);
-    }
-
-    ensure!(!payloads.is_empty(), "Cert chain is empty.");
-
-    Ok(payloads)
-}
+use thiserror::Error;
 
 /// Represents a full Boot Certificate Chain (BCC). This consists of the root public key (which
 /// signs the first certificate), followed by a chain of BccEntry certificates. Apart from the
 /// first, the issuer of each cert is the subject of the previous one.
+#[derive(Debug)]
 pub struct Chain {
     root_public_key: PublicKey,
     payloads: Vec<Payload>,
 }
 
+#[derive(Error, Debug, PartialEq, Eq)]
+pub(crate) enum ValidationError {
+    #[error("no payloads")]
+    NoPayloads,
+    #[error("issuer `{1}` is not previous subject `{2}` in payload {0}")]
+    IssuerMismatch(usize, String, String),
+    #[error("repeated subject in payload {0}")]
+    RepeatedSubject(usize, String),
+    #[error("repeated key in payload {0}")]
+    RepeatedKey(usize),
+}
+
 impl Chain {
-    /// Decode and validate a Chain from its CBOR representation. This ensures the CBOR is
-    /// well-formed, that all required fields are present, and all present fields contain
-    /// reasonable values. The signature of each certificate is validated and the payload
-    /// extracted. This does not perform any semantic validation of the data in the
-    /// certificates such as the Authority, Config and Code hashes.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        /*
-         * CDDL (from keymint/ProtectedData.aidl):
-         *
-         * Bcc = [
-         *     PubKeyEd25519 / PubKeyECDSA256, // DK_pub
-         *     + BccEntry,                     // Root -> leaf (KM_pub)
-         * ]
-         */
+    /// Builds a [`Chain`] after checking that it is well-formed. The issuer of each entry must be
+    /// equal to the subject of the previous entry. The chain is not allowed to contain any
+    /// repeated subjects or subject public keys as that would suggest something untoward has
+    /// happened.
+    pub(crate) fn validate(
+        root_public_key: PublicKey,
+        payloads: Vec<Payload>,
+    ) -> Result<Self, ValidationError> {
+        if payloads.is_empty() {
+            return Err(ValidationError::NoPayloads);
+        }
 
-        let value = value_from_bytes(bytes).context("Unable to decode top-level CBOR")?;
-        let array = match value {
-            Array(array) if array.len() >= 2 => array,
-            _ => bail!("Invalid BCC. Expected an array of at least length 2, found: {:?}", value),
-        };
-        let mut it = array.into_iter();
+        let mut subjects = HashSet::with_capacity(payloads.len());
+        let mut keys = HashSet::with_capacity(1 + payloads.len());
+        keys.insert(root_public_key.to_pem());
 
-        let root_public_key = CoseKey::from_cbor_value(it.next().unwrap())
-            .map_err(cose_error)
-            .context("Error parsing root public key CBOR")?;
-        let root_public_key =
-            PublicKey::from_cose_key(&root_public_key).context("Invalid root key")?;
-
-        let payloads =
-            check_sign1_chain(it, Some(&root_public_key)).context("Invalid certificate chain")?;
+        let mut previous_subject: Option<&str> = None;
+        for (n, payload) in payloads.iter().enumerate() {
+            if let Some(previous_subject) = previous_subject {
+                if payload.issuer() != previous_subject {
+                    return Err(ValidationError::IssuerMismatch(
+                        n,
+                        payload.issuer().to_string(),
+                        previous_subject.to_string(),
+                    ));
+                }
+            }
+            if subjects.replace(payload.subject()).is_some() {
+                return Err(ValidationError::RepeatedSubject(n, payload.subject().to_string()));
+            }
+            if keys.replace(payload.subject_public_key().to_pem()).is_some() {
+                return Err(ValidationError::RepeatedKey(n));
+            }
+            previous_subject = Some(payload.subject());
+        }
 
         Ok(Self { root_public_key, payloads })
     }
@@ -100,8 +87,8 @@ impl Chain {
 
 impl Display for Chain {
     fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
-        writeln!(f, "Root public key: {}", self.root_public_key)?;
-        writeln!(f)?;
+        writeln!(f, "Root public key:")?;
+        writeln!(f, "{}", self.root_public_key.to_pem())?;
         for (i, payload) in self.payloads.iter().enumerate() {
             writeln!(f, "Cert {}:", i)?;
             writeln!(f, "{}", payload)?;
@@ -113,76 +100,87 @@ impl Display for Chain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value_from_file;
-    use std::fs;
+    use crate::bcc::entry::{DiceMode, PayloadBuilder};
+    use crate::publickey::testkeys::{PrivateKey, ED25519_KEY_PEM, P256_KEY_PEM, P384_KEY_PEM};
 
     #[test]
-    fn test_check_chain_valid() -> Result<()> {
-        let chain = fs::read("testdata/bcc/valid.chain").unwrap();
-        let chain = Chain::from_bytes(&chain)?;
-        assert_eq!(chain.payloads().len(), 8);
-        Ok(())
+    fn chain_validate_valid() {
+        let root_public_key = PrivateKey::from_pem(P256_KEY_PEM[0]).public_key();
+        let keys = P256_KEY_PEM[1..4].iter().copied().enumerate();
+        let payloads = keys.map(|(n, key)| valid_payload(n, key).build().unwrap()).collect();
+        Chain::validate(root_public_key, payloads).unwrap();
     }
 
     #[test]
-    fn test_check_chain_valid_p256() -> Result<()> {
-        let chain = fs::read("testdata/bcc/valid_p256.chain").unwrap();
-        let chain = Chain::from_bytes(&chain)?;
-        assert_eq!(chain.payloads().len(), 3);
-        Ok(())
+    fn chain_validate_valid_with_mixed_kinds_of_key() {
+        let root_public_key = PrivateKey::from_pem(ED25519_KEY_PEM[0]).public_key();
+        let keys = [P256_KEY_PEM[0], P384_KEY_PEM[0]].into_iter().enumerate();
+        let payloads = keys.map(|(n, key)| valid_payload(n, key).build().unwrap()).collect();
+        Chain::validate(root_public_key, payloads).unwrap();
     }
 
     #[test]
-    fn test_check_chain_bad_p256() {
-        let chain = fs::read("testdata/bcc/bad_p256.chain").unwrap();
-        assert!(Chain::from_bytes(&chain).is_err());
+    fn chain_validate_fails_without_payloads() {
+        let root_public_key = PrivateKey::from_pem(P256_KEY_PEM[0]).public_key();
+        let payloads = Vec::new();
+        let err = Chain::validate(root_public_key, payloads).unwrap_err();
+        assert_eq!(err, ValidationError::NoPayloads);
     }
 
     #[test]
-    fn test_check_chain_bad_pub_key() {
-        let chain = fs::read("testdata/bcc/bad_pub_key.chain").unwrap();
-        assert!(Chain::from_bytes(&chain).is_err());
+    fn chain_validate_fails_when_root_key_repeated() {
+        let key = P256_KEY_PEM[0];
+        let root_public_key = PrivateKey::from_pem(key).public_key();
+        let payloads = vec![valid_payload(0, key).build().unwrap()];
+        let err = Chain::validate(root_public_key, payloads).unwrap_err();
+        assert_eq!(err, ValidationError::RepeatedKey(0));
     }
 
     #[test]
-    fn test_check_chain_bad_final_signature() {
-        let chain = fs::read("testdata/bcc/bad_final_signature.chain").unwrap();
-        assert!(Chain::from_bytes(&chain).is_err());
-    }
-
-    #[test]
-    fn test_check_sign1_cert_chain() -> Result<()> {
-        let chain = [
-            value_from_file("testdata/bcc/_CBOR_Ed25519_cert_full_cert_chain_0.cert")?,
-            value_from_file("testdata/bcc/_CBOR_Ed25519_cert_full_cert_chain_1.cert")?,
-            value_from_file("testdata/bcc/_CBOR_Ed25519_cert_full_cert_chain_2.cert")?,
+    fn chain_validate_fails_with_repeated_subject_public_keys() {
+        let repeated_key = P256_KEY_PEM[0];
+        let root_public_key = PrivateKey::from_pem(ED25519_KEY_PEM[0]).public_key();
+        let payloads = vec![
+            valid_payload(0, repeated_key).build().unwrap(),
+            valid_payload(1, repeated_key).build().unwrap(),
         ];
-        let root_key = None;
-        check_sign1_chain(chain, root_key)?;
-        Ok(())
+        let err = Chain::validate(root_public_key, payloads).unwrap_err();
+        assert_eq!(err, ValidationError::RepeatedKey(1));
     }
 
     #[test]
-    fn test_check_sign1_cert_chain_invalid() -> Result<()> {
-        let chain = [
-            value_from_file("testdata/bcc/_CBOR_Ed25519_cert_full_cert_chain_0.cert")?,
-            value_from_file("testdata/bcc/_CBOR_Ed25519_cert_full_cert_chain_2.cert")?,
+    fn chain_validate_fails_with_repeated_subjects() {
+        let keys = &P256_KEY_PEM[..3];
+        let repeated = "match";
+        let root_public_key = PrivateKey::from_pem(ED25519_KEY_PEM[0]).public_key();
+        let payloads = vec![
+            valid_payload(0, keys[0]).subject(repeated).build().unwrap(),
+            valid_payload(1, keys[1]).issuer(repeated).build().unwrap(),
+            valid_payload(2, keys[2]).subject(repeated).build().unwrap(),
         ];
-        let root_key = None;
-        assert!(check_sign1_chain(chain, root_key).is_err());
-        Ok(())
+        let err = Chain::validate(root_public_key, payloads).unwrap_err();
+        assert_eq!(err, ValidationError::RepeatedSubject(2, repeated.into()));
     }
 
     #[test]
-    fn test_check_sign1_chain_array() -> Result<()> {
-        let cbor_file = value_from_file("testdata/bcc/_CBOR_bcc_entry_cert_array.cert")?;
-        let cbor_arr = match cbor_file {
-            Value::Array(a) => a,
-            _ => bail!("Not an array"),
-        };
-        assert_eq!(cbor_arr.len(), 3);
-        let root_key = None;
-        check_sign1_chain(cbor_arr, root_key)?;
-        Ok(())
+    fn chain_validate_fails_with_mismatching_issuer_and_subject() {
+        let expected = "expected";
+        let wrong = "wrong";
+        let root_public_key = PrivateKey::from_pem(P256_KEY_PEM[0]).public_key();
+        let payloads = vec![
+            valid_payload(0, P256_KEY_PEM[1]).subject(expected).build().unwrap(),
+            valid_payload(1, P256_KEY_PEM[2]).issuer(wrong).build().unwrap(),
+        ];
+        let err = Chain::validate(root_public_key, payloads).unwrap_err();
+        assert_eq!(err, ValidationError::IssuerMismatch(1, wrong.into(), expected.into()));
+    }
+
+    fn valid_payload(index: usize, pem: &str) -> PayloadBuilder {
+        PayloadBuilder::with_subject_public_key(PrivateKey::from_pem(pem).public_key())
+            .issuer(format!("component {}", index))
+            .subject(format!("component {}", index + 1))
+            .mode(DiceMode::Normal)
+            .code_hash(vec![0; 64])
+            .authority_hash(vec![0; 64])
     }
 }
