@@ -1,72 +1,89 @@
 //! This module wraps the certificate validation functions intended for BccEntry.
 
-use super::cose_error;
-use super::field_value::FieldValue;
-use crate::dice;
-use crate::display::{write_bytes_field, write_value};
 use crate::publickey::PublicKey;
-use crate::value_from_bytes;
-use anyhow::{anyhow, bail, ensure, Context, Result};
-use ciborium::value::Value;
-use coset::AsCborValue;
-use coset::{Algorithm, CborSerializable, CoseKey, CoseSign1, Header};
-use std::collections::hash_map::Entry::{Occupied, Vacant};
-use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
+use thiserror::Error;
 
-/// Validate the protected header of a bcc entry with respect to the provided
-/// alg (typically originating from the subject public key of the payload).
-fn check_protected_header(alg: &Algorithm, header: &Header) -> Result<()> {
-    ensure!(
-        header.alg.as_ref() == Some(alg),
-        "Protected 'alg' header doesn't have the expected algorithm"
-    );
-    ensure!(header.crit.is_empty(), "No critical header values may be defined in the BCC");
-    Ok(())
-}
-
-/// Represents the mode value defined by the Open Profile for DICE. See
-/// https://pigweed.googlesource.com/open-dice/+/refs/heads/main/docs/specification.md#mode-value-details.
-#[repr(u8)]
-#[derive(Debug, Copy, Clone)]
-#[allow(missing_docs)]
+/// Enumeration of modes used in the DICE chain payloads.
+#[derive(Debug, Default, Copy, Clone)]
 pub enum DiceMode {
-    NotConfigured = 0,
-    Normal = 1,
-    Debug = 2,
-    Recovery = 3,
+    /// This mode also acts as a catch-all for configurations which do not fit the other modes and
+    /// invalid modes.
+    #[default]
+    NotConfigured,
+    /// The device is operating normally under secure configuration.
+    Normal,
+    /// At least one criteria for [`Normal`] is not met and the device is not in a secure state.
+    Debug,
+    /// A recovery or maintenance mode of some kind.
+    Recovery,
 }
 
-impl From<u8> for DiceMode {
-    fn from(byte: u8) -> Self {
-        // You can match against a constant, but not an expression.
-        const NORMAL: u8 = DiceMode::Normal as u8;
-        const DEBUG: u8 = DiceMode::Debug as u8;
-        const RECOVERY: u8 = DiceMode::Recovery as u8;
-
-        match byte {
-            NORMAL => Self::Normal,
-            DEBUG => Self::Debug,
-            RECOVERY => Self::Recovery,
-            _ => Self::NotConfigured, // open-dice says to treat unknown values as this
-        }
-    }
-}
-
-/// Represents a decoded BccPayload value.
-#[non_exhaustive]
-#[allow(missing_docs)]
+/// The payload of a DICE chain entry.
+#[derive(Debug)]
 pub struct Payload {
-    pub issuer: String,
-    pub subject: String,
-    pub subject_public_key: PublicKey,
-    pub mode: DiceMode,
-    pub code_desc: Option<Vec<u8>>,
-    pub code_hash: Vec<u8>,
-    pub config_desc: ConfigDesc,
-    pub config_hash: Option<Vec<u8>>,
-    pub authority_desc: Option<Vec<u8>>,
-    pub authority_hash: Vec<u8>,
+    issuer: String,
+    subject: String,
+    subject_public_key: PublicKey,
+    mode: DiceMode,
+    code_desc: Option<Vec<u8>>,
+    code_hash: Vec<u8>,
+    config_desc: ConfigDesc,
+    config_hash: Option<Vec<u8>>,
+    authority_desc: Option<Vec<u8>>,
+    authority_hash: Vec<u8>,
+}
+
+impl Payload {
+    /// Gets the issuer of the payload.
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// Gets the subject of the payload.
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    /// Gets the subject public key of the payload.
+    pub fn subject_public_key(&self) -> &PublicKey {
+        &self.subject_public_key
+    }
+
+    /// Gets the mode of the payload.
+    pub fn mode(&self) -> DiceMode {
+        self.mode
+    }
+
+    /// Gets the code descriptor of the payload.
+    pub fn code_desc(&self) -> Option<&[u8]> {
+        self.code_desc.as_deref()
+    }
+
+    /// Gets the code hash of the payload.
+    pub fn code_hash(&self) -> &[u8] {
+        &self.code_hash
+    }
+
+    /// Gets the configuration descriptor of the payload.
+    pub fn config_desc(&self) -> &ConfigDesc {
+        &self.config_desc
+    }
+
+    /// Gets the configuration hash of the payload.
+    pub fn config_hash(&self) -> Option<&[u8]> {
+        self.config_hash.as_deref()
+    }
+
+    /// Gets the authority descriptor of the payload.
+    pub fn authority_desc(&self) -> Option<&[u8]> {
+        self.authority_desc.as_deref()
+    }
+
+    /// Gets the authority hash of the payload.
+    pub fn authority_hash(&self) -> &[u8] {
+        &self.authority_hash
+    }
 }
 
 impl Display for Payload {
@@ -75,154 +92,165 @@ impl Display for Payload {
         writeln!(f, "Subject: {}", self.subject)?;
         writeln!(f, "Mode: {:?}", self.mode)?;
         if let Some(code_desc) = &self.code_desc {
-            write_bytes_field(f, "Code Desc", code_desc)?;
+            writeln!(f, "Code Desc: {}", hex::encode(code_desc))?;
         }
-        write_bytes_field(f, "Code Hash", &self.code_hash)?;
+        writeln!(f, "Code Hash: {}", hex::encode(&self.code_hash))?;
         if let Some(config_hash) = &self.config_hash {
-            write_bytes_field(f, "Config Hash", config_hash)?;
+            writeln!(f, "Config Hash: {}", hex::encode(config_hash))?;
         }
         if let Some(authority_desc) = &self.authority_desc {
-            write_bytes_field(f, "Authority Desc", authority_desc)?;
+            writeln!(f, "Authority Desc: {}", hex::encode(authority_desc))?;
         }
-        write_bytes_field(f, "Authority Hash", &self.authority_hash)?;
+        writeln!(f, "Authority Hash: {}", hex::encode(&self.authority_hash))?;
         writeln!(f, "Config Desc:")?;
         write!(f, "{}", &self.config_desc)?;
         Ok(())
     }
 }
 
-impl Payload {
-    pub(super) fn from_cbor_sign1(
-        public_key: Option<&PublicKey>,
-        expected_issuer: Option<&str>,
-        cbor: Value,
-    ) -> Result<Self> {
-        let entry = CoseSign1::from_cbor_value(cbor)
-            .map_err(cose_error)
-            .context("Given CBOR does not appear to be a COSE_sign1")?;
-        let payload = Self::from_sign1(public_key, expected_issuer, &entry)
-            .context("Unable to extract payload from COSE_sign1")?;
-        Ok(payload)
+#[derive(Error, Debug, PartialEq, Eq)]
+pub(crate) enum PayloadBuilderError {
+    #[error("issuer empty")]
+    IssuerEmpty,
+    #[error("subject empty")]
+    SubjectEmpty,
+    #[error("bad code hash size")]
+    CodeHashSize,
+    #[error("bad config hash size")]
+    ConfigHashSize,
+    #[error("bad authority hash size")]
+    AuthorityHashSize,
+}
+
+pub(crate) struct PayloadBuilder(Payload);
+
+impl PayloadBuilder {
+    /// Constructs a new builder with the given subject public key.
+    pub fn with_subject_public_key(subject_public_key: PublicKey) -> Self {
+        Self(Payload {
+            issuer: Default::default(),
+            subject: Default::default(),
+            subject_public_key,
+            mode: Default::default(),
+            code_desc: Default::default(),
+            code_hash: Default::default(),
+            config_desc: Default::default(),
+            config_hash: Default::default(),
+            authority_desc: Default::default(),
+            authority_hash: Default::default(),
+        })
     }
 
-    pub(super) fn from_sign1(
-        pkey: Option<&PublicKey>,
-        expected_issuer: Option<&str>,
-        sign1: &CoseSign1,
-    ) -> Result<Self> {
-        if let Some(pkey) = pkey {
-            check_protected_header(&pkey.algorithm(), &sign1.protected.header)
-                .context("Validation of bcc entry protected header failed.")?;
-            sign1.verify_signature(b"", |s, m| pkey.verify(s, m)).with_context(|| {
-                format!("public key {} incorrectly signs the given cose_sign1 cert.", pkey)
-            })?;
+    /// Builds the [`Payload`] after validating the fields.
+    pub fn build(self) -> Result<Payload, PayloadBuilderError> {
+        if self.0.issuer.is_empty() {
+            return Err(PayloadBuilderError::IssuerEmpty);
         }
-
-        let bytes = sign1.payload.as_ref().ok_or_else(|| anyhow!("no payload"))?;
-        let payload = Self::from_slice(bytes.as_slice())?;
-        if let Some(expected_issuer) = expected_issuer {
-            ensure!(
-                payload.issuer == expected_issuer,
-                "COSE_sign1's issuer ({}) does not match the subject of the previous payload in \
-                the chain ({}).",
-                payload.issuer,
-                expected_issuer
-            );
+        if self.0.subject.is_empty() {
+            return Err(PayloadBuilderError::SubjectEmpty);
         }
-        Ok(payload)
-    }
-
-    fn from_slice(bytes: &[u8]) -> Result<Self> {
-        let entries = cbor_map_from_slice(bytes)?;
-
-        let mut issuer = FieldValue::new("issuer");
-        let mut subject = FieldValue::new("subject");
-        let mut subject_public_key = FieldValue::new("subject public key");
-        let mut mode = FieldValue::new("mode");
-        let mut code_desc = FieldValue::new("code desc");
-        let mut code_hash = FieldValue::new("code hash");
-        let mut config_desc = FieldValue::new("config desc");
-        let mut config_hash = FieldValue::new("config hash");
-        let mut authority_desc = FieldValue::new("authority desc");
-        let mut authority_hash = FieldValue::new("authority hash");
-        let mut key_usage = FieldValue::new("key usage");
-
-        for (key, value) in entries.into_iter() {
-            if let Some(Ok(key)) = key.as_integer().map(TryInto::try_into) {
-                let field = match key {
-                    dice::ISS => &mut issuer,
-                    dice::SUB => &mut subject,
-                    dice::SUBJECT_PUBLIC_KEY => &mut subject_public_key,
-                    dice::MODE => &mut mode,
-                    dice::CODE_DESC => &mut code_desc,
-                    dice::CODE_HASH => &mut code_hash,
-                    dice::CONFIG_DESC => &mut config_desc,
-                    dice::CONFIG_HASH => &mut config_hash,
-                    dice::AUTHORITY_DESC => &mut authority_desc,
-                    dice::AUTHORITY_HASH => &mut authority_hash,
-                    dice::KEY_USAGE => &mut key_usage,
-                    _ => bail!("Unknown key {}", key),
-                };
-                field.set(value)?;
-            } else {
-                bail!("Invalid key: {:?}", key);
+        let used_hash_size = self.0.code_hash.len();
+        if used_hash_size != 32 && used_hash_size != 64 {
+            return Err(PayloadBuilderError::CodeHashSize);
+        }
+        if let Some(ref config_hash) = self.0.config_hash {
+            if config_hash.len() != used_hash_size {
+                return Err(PayloadBuilderError::ConfigHashSize);
             }
         }
+        if self.0.authority_hash.len() != used_hash_size {
+            return Err(PayloadBuilderError::AuthorityHashSize);
+        }
+        Ok(self.0)
+    }
 
-        let issuer = issuer.into_string().context("Issuer must be a string")?;
-        let subject = subject.into_string().context("Subject must be a string")?;
-        let subject_public_key =
-            subject_public_key.into_bytes().context("Subject public key must be bytes")?;
-        let mode = mode.into_bytes().context("Mode must be bytes")?;
-        let code_desc = code_desc.into_optional_bytes().context("Code descriptor must be bytes")?;
-        let code_hash = code_hash.into_bytes().context("Code hash must be bytes")?;
-        let config_desc = config_desc.into_bytes().context("Config descriptor must be bytes")?;
-        let config_hash = config_hash.into_optional_bytes().context("Config hash must be bytes")?;
-        let authority_desc =
-            authority_desc.into_optional_bytes().context("Authority descriptor must be bytes")?;
-        let authority_hash = authority_hash.into_bytes().context("Authority hash must be bytes")?;
-        let key_usage = key_usage.into_bytes().context("Key usage must be bytes")?;
+    /// Sets the issuer of the payload.
+    #[must_use]
+    pub fn issuer<S: Into<String>>(mut self, issuer: S) -> Self {
+        self.0.issuer = issuer.into();
+        self
+    }
 
-        let subject_public_key = CoseKey::from_slice(&subject_public_key)
-            .map_err(cose_error)
-            .context("Error parsing subject public key from bytes")?;
-        let subject_public_key = PublicKey::from_cose_key(&subject_public_key)
-            .context("Error parsing subject public key from COSE_key")?;
-        if mode.len() != 1 {
-            bail!("Expected mode to be a single byte, actual byte count: {}", mode.len())
-        };
-        let mode = DiceMode::from(mode[0]);
+    /// Sets the subject of the payload.
+    #[must_use]
+    pub fn subject<S: Into<String>>(mut self, subject: S) -> Self {
+        self.0.subject = subject.into();
+        self
+    }
 
-        let config_desc = ConfigDesc::from_slice(&config_desc)
-            .context("Error parsing config descriptor from bytes")?;
+    /// Sets the mode of the payload.
+    #[must_use]
+    pub fn mode(mut self, mode: DiceMode) -> Self {
+        self.0.mode = mode;
+        self
+    }
 
-        if key_usage.len() != 1 || key_usage[0] != 0x20 {
-            bail!("key usage must be keyCertSign")
-        };
+    /// Sets the code descriptor of the payload.
+    #[must_use]
+    pub fn code_desc(mut self, code_desc: Option<Vec<u8>>) -> Self {
+        self.0.code_desc = code_desc;
+        self
+    }
 
-        Ok(Self {
-            issuer,
-            subject,
-            subject_public_key,
-            mode,
-            code_desc,
-            code_hash,
-            config_desc,
-            config_hash,
-            authority_desc,
-            authority_hash,
-        })
+    /// Sets the code hash of the payload.
+    #[must_use]
+    pub fn code_hash(mut self, code_hash: Vec<u8>) -> Self {
+        self.0.code_hash = code_hash;
+        self
+    }
+
+    /// Sets the configuration descriptor of the payload.
+    #[must_use]
+    pub fn config_desc(mut self, config_desc: ConfigDesc) -> Self {
+        self.0.config_desc = config_desc;
+        self
+    }
+
+    /// Sets the configuration hash of the payload.
+    #[must_use]
+    pub fn config_hash(mut self, config_hash: Option<Vec<u8>>) -> Self {
+        self.0.config_hash = config_hash;
+        self
+    }
+
+    /// Sets the authority descriptor of the payload.
+    #[must_use]
+    pub fn authority_desc(mut self, authority_desc: Option<Vec<u8>>) -> Self {
+        self.0.authority_desc = authority_desc;
+        self
+    }
+
+    /// Sets the authority hash of the payload.
+    #[must_use]
+    pub fn authority_hash(mut self, authority_hash: Vec<u8>) -> Self {
+        self.0.authority_hash = authority_hash;
+        self
     }
 }
 
-// Represents a decoded Configuration Descriptor from within a BccPayload.
-#[non_exhaustive]
-#[allow(missing_docs)]
+/// Fields from the configuration descriptor.
+#[derive(Debug, Default, Clone)]
 pub struct ConfigDesc {
-    pub component_name: Option<String>,
-    pub component_version: Option<i64>,
-    pub resettable: bool,
-    extensions: HashMap<i64, Value>, // TODO: Figure out how to expose this
+    component_name: Option<String>,
+    component_version: Option<i64>,
+    resettable: bool,
+}
+
+impl ConfigDesc {
+    /// Gets the component name.
+    pub fn component_name(&self) -> Option<&str> {
+        self.component_name.as_deref()
+    }
+
+    /// Gets the component version.
+    pub fn component_version(&self) -> Option<i64> {
+        self.component_version
+    }
+
+    /// Returns whether the component is factory resettable.
+    pub fn resettable(&self) -> bool {
+        self.resettable
+    }
 }
 
 impl Display for ConfigDesc {
@@ -236,88 +264,128 @@ impl Display for ConfigDesc {
         if self.resettable {
             writeln!(f, "Resettable")?;
         }
-        for (key, value) in self.extensions.iter() {
-            write!(f, "{}: ", key)?;
-            write_value(f, value)?;
-            writeln!(f)?;
-        }
         Ok(())
     }
 }
 
-impl ConfigDesc {
-    fn from_slice(bytes: &[u8]) -> Result<Self> {
-        let entries = cbor_map_from_slice(bytes)?;
+pub(crate) struct ConfigDescBuilder(ConfigDesc);
 
-        let mut component_name = FieldValue::new("component name");
-        let mut component_version = FieldValue::new("component version");
-        let mut resettable = FieldValue::new("resettable");
-        let mut extensions = HashMap::new();
-
-        for (key, value) in entries.into_iter() {
-            if let Some(Ok(key)) = key.as_integer().map(TryInto::try_into) {
-                match key {
-                    dice::COMPONENT_NAME => {
-                        component_name.set(value).context("Error setting component name")?
-                    }
-                    dice::COMPONENT_VERSION => {
-                        component_version.set(value).context("Error setting component version")?
-                    }
-                    dice::RESETTABLE => {
-                        resettable.set(value).context("Error setting resettable")?
-                    }
-                    _ => match extensions.entry(key) {
-                        Vacant(entry) => {
-                            entry.insert(value);
-                        }
-                        Occupied(entry) => {
-                            bail!("Duplicate values for {}: {:?} and {:?}", key, entry.get(), value)
-                        }
-                    },
-                };
-            } else {
-                bail!("Invalid key: {:?}", key);
-            }
-        }
-
-        let component_name =
-            component_name.into_optional_string().context("Component name must be a string")?;
-        let component_version = component_version
-            .into_optional_i64()
-            .context("Component version must be an integer")?;
-        let resettable = resettable.is_null().context("Error interpreting resettable field")?;
-
-        Ok(Self { component_name, component_version, resettable, extensions })
+impl ConfigDescBuilder {
+    /// Constructs a new builder with default values.
+    pub fn new() -> Self {
+        Self(ConfigDesc::default())
     }
-}
 
-fn cbor_map_from_slice(bytes: &[u8]) -> Result<Vec<(Value, Value)>> {
-    let value = value_from_bytes(bytes).context("Error parsing CBOR into a map")?;
-    let entries = match value {
-        Value::Map(entries) => entries,
-        _ => bail!("Not a map: {:?}", value),
-    };
-    Ok(entries)
+    /// Builds the [`ConfigDesc`].
+    pub fn build(self) -> ConfigDesc {
+        self.0
+    }
+
+    /// Sets the component name.
+    #[must_use]
+    pub fn component_name(mut self, name: Option<String>) -> Self {
+        self.0.component_name = name;
+        self
+    }
+
+    /// Sets the component version.
+    #[must_use]
+    pub fn component_version(mut self, version: Option<i64>) -> Self {
+        self.0.component_version = version;
+        self
+    }
+
+    /// Sets whether the component is factory resettable.
+    #[must_use]
+    pub fn resettable(mut self, resettable: bool) -> Self {
+        self.0.resettable = resettable;
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coset::{iana, Header, Label, RegisteredLabel};
+    use crate::publickey::testkeys::{PrivateKey, P256_KEY_PEM};
 
     #[test]
-    fn test_check_bcc_entry_protected_header() -> Result<()> {
-        let eddsa = coset::Algorithm::Assigned(iana::Algorithm::EdDSA);
-        let header = Header { alg: Some(eddsa.clone()), ..Default::default() };
-        check_protected_header(&eddsa, &header).context("Only alg allowed")?;
-        let header = Header { alg: Some(coset::Algorithm::PrivateUse(1000)), ..Default::default() };
-        assert!(check_protected_header(&eddsa, &header).is_err());
-        let mut header = Header { alg: Some(eddsa.clone()), ..Default::default() };
-        header.rest.push((Label::Int(1000), Value::from(2000u16)));
-        check_protected_header(&eddsa, &header).context("non-crit header allowed")?;
-        let mut header = Header { alg: Some(eddsa.clone()), ..Default::default() };
-        header.crit.push(RegisteredLabel::Assigned(iana::HeaderParameter::CounterSignature));
-        assert!(check_protected_header(&eddsa, &header).is_err());
-        Ok(())
+    fn payload_builder_valid() {
+        valid_payload().build().unwrap();
+    }
+
+    #[test]
+    fn payload_builder_valid_512_bit_hashes() {
+        valid_payload()
+            .code_hash(vec![1; 64])
+            .authority_hash(vec![2; 64])
+            .config_hash(Some(vec![3; 64]))
+            .build()
+            .unwrap();
+    }
+
+    #[test]
+    fn payload_builder_valid_256_bit_hashes() {
+        valid_payload()
+            .code_hash(vec![1; 32])
+            .authority_hash(vec![2; 32])
+            .config_hash(Some(vec![3; 32]))
+            .build()
+            .unwrap();
+    }
+
+    #[test]
+    fn payload_builder_empty_issuer() {
+        let err = valid_payload().issuer("").build().unwrap_err();
+        assert_eq!(err, PayloadBuilderError::IssuerEmpty);
+    }
+
+    #[test]
+    fn payload_builder_empty_subject() {
+        let err = valid_payload().subject("").build().unwrap_err();
+        assert_eq!(err, PayloadBuilderError::SubjectEmpty);
+    }
+
+    #[test]
+    fn payload_builder_bad_code_hash_size() {
+        let err = valid_payload().code_hash(vec![1; 48]).build().unwrap_err();
+        assert_eq!(err, PayloadBuilderError::CodeHashSize);
+    }
+
+    #[test]
+    fn payload_builder_bad_authority_hash_size() {
+        let err = valid_payload().authority_hash(vec![1; 48]).build().unwrap_err();
+        assert_eq!(err, PayloadBuilderError::AuthorityHashSize);
+    }
+
+    #[test]
+    fn payload_builder_inconsistent_authority_hash_size() {
+        let err =
+            valid_payload().code_hash(vec![1; 32]).authority_hash(vec![1; 64]).build().unwrap_err();
+        assert_eq!(err, PayloadBuilderError::AuthorityHashSize);
+    }
+
+    #[test]
+    fn payload_builder_bad_config_hash_size() {
+        let err = valid_payload().config_hash(Some(vec![1; 48])).build().unwrap_err();
+        assert_eq!(err, PayloadBuilderError::ConfigHashSize);
+    }
+
+    #[test]
+    fn payload_builder_inconsistent_config_hash_size() {
+        let err = valid_payload()
+            .code_hash(vec![1; 64])
+            .config_hash(Some(vec![1; 32]))
+            .build()
+            .unwrap_err();
+        assert_eq!(err, PayloadBuilderError::ConfigHashSize);
+    }
+
+    fn valid_payload() -> PayloadBuilder {
+        let key = PrivateKey::from_pem(P256_KEY_PEM[0]).public_key();
+        PayloadBuilder::with_subject_public_key(key)
+            .issuer("issuer")
+            .subject("subject")
+            .code_hash(vec![1; 64])
+            .authority_hash(vec![2; 64])
     }
 }
