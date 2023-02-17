@@ -1,159 +1,53 @@
-//! This module describes the public key (PubKeyEd25519, PubKeyECDSA256 or
-//! PubKeyECDSA384) used in the BccPayload. The key itself is stored as a
-//! simple byte array in a vector.
+//! This module describes a public key that is restricted to one of the supported algorithms.
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
-use coset::cbor::value::Value;
-use coset::iana::{self, EnumI64};
-use coset::{Algorithm, CoseKey, KeyOperation, KeyType, Label};
-use openssl::bn::BigNum;
-use openssl::ec::{EcGroup, EcKey};
-use openssl::ecdsa::EcdsaSig;
+use anyhow::{ensure, Context, Result};
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
-use openssl::pkey::{Id, PKey, Public};
+use openssl::pkey::{HasParams, Id, PKey, PKeyRef, Public};
 use openssl::sign::Verifier;
 use std::error::Error;
 use std::fmt;
 
-/// Get the value corresponding to the provided label within the supplied CoseKey or error if it's
-/// not present.
-fn get_label_value(key: &CoseKey, label: Label) -> Result<&Value> {
-    Ok(&key
-        .params
-        .iter()
-        .find(|(k, _)| k == &label)
-        .ok_or_else(|| anyhow!("Label {:?} not found", label))?
-        .1)
-}
-
-/// Get the byte string for the corresponding label within the key if the label exists and the
-/// value is actually a byte array.
-fn get_label_value_as_bytes(key: &CoseKey, label: Label) -> Result<&[u8]> {
-    get_label_value(key, label)?
-        .as_bytes()
-        .ok_or_else(|| anyhow!("Value not a bstr."))
-        .map(Vec::as_slice)
-}
-
 /// Enumeration of the kinds of key that are supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Ed25519,
     Ec(EcKind),
 }
 
 /// Enumeration of the kinds of elliptic curve keys that are supported.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EcKind {
+pub(crate) enum EcKind {
     P256,
     P384,
 }
 
 /// Struct wrapping the public key and relevant validation methods.
+#[derive(Clone, Debug)]
 pub struct PublicKey {
     kind: Kind,
     pkey: PKey<Public>,
 }
 
 impl PublicKey {
-    pub(super) fn from_cose_key(pkey: &CoseKey) -> Result<Self> {
-        if !pkey.key_ops.is_empty() {
-            ensure!(pkey.key_ops.contains(&KeyOperation::Assigned(iana::KeyOperation::Verify)));
-        }
-        match pkey.kty {
-            KeyType::Assigned(iana::KeyType::OKP) => Self::from_cose_okp_key(pkey),
-            KeyType::Assigned(iana::KeyType::EC2) => Self::from_cose_ec2_key(pkey),
-            _ => bail!("Unexpected KeyType value: {:?}", pkey.kty),
-        }
+    pub(crate) fn kind(&self) -> Kind {
+        self.kind
     }
 
-    fn from_cose_okp_key(pkey: &CoseKey) -> Result<Self> {
-        ensure!(pkey.kty == KeyType::Assigned(iana::KeyType::OKP));
-        ensure!(pkey.alg == Some(Algorithm::Assigned(iana::Algorithm::EdDSA)));
-        let crv = get_label_value(pkey, Label::Int(iana::OkpKeyParameter::Crv.to_i64()))?;
-        let x = get_label_value_as_bytes(pkey, Label::Int(iana::OkpKeyParameter::X.to_i64()))?;
-        ensure!(crv == &Value::from(iana::EllipticCurve::Ed25519.to_i64()));
-        let pkey =
-            PKey::public_key_from_raw_bytes(x, Id::ED25519).context("Failed to instantiate key")?;
-        Ok(Self { kind: Kind::Ed25519, pkey })
-    }
-
-    fn from_cose_ec2_key(pkey: &CoseKey) -> Result<Self> {
-        ensure!(pkey.kty == KeyType::Assigned(iana::KeyType::EC2));
-        let crv = get_label_value(pkey, Label::Int(iana::Ec2KeyParameter::Crv.to_i64()))?;
-        let x = get_label_value_as_bytes(pkey, Label::Int(iana::Ec2KeyParameter::X.to_i64()))?;
-        let y = get_label_value_as_bytes(pkey, Label::Int(iana::Ec2KeyParameter::Y.to_i64()))?;
-        match pkey.alg {
-            Some(Algorithm::Assigned(iana::Algorithm::ES256)) => {
-                ensure!(crv == &Value::from(iana::EllipticCurve::P_256.to_i64()));
-                let pkey = Self::ec_pkey_from_bytes(Nid::X9_62_PRIME256V1, x, y)
-                    .context("Failed to instantiate key")?;
-                Ok(Self { kind: Kind::Ec(EcKind::P256), pkey })
-            }
-            Some(Algorithm::Assigned(iana::Algorithm::ES384)) => {
-                ensure!(crv == &Value::from(iana::EllipticCurve::P_384.to_i64()));
-                let pkey = Self::ec_pkey_from_bytes(Nid::SECP384R1, x, y)
-                    .context("Failed to instantiate key")?;
-                Ok(Self { kind: Kind::Ec(EcKind::P384), pkey })
-            }
-            _ => bail!("Need to specify ES256 or ES384 in the key. Got {:?}", pkey.alg),
-        }
-    }
-
-    fn ec_pkey_from_bytes(nid: Nid, x_coord: &[u8], y_coord: &[u8]) -> Result<PKey<Public>> {
-        let group = EcGroup::from_curve_name(nid).context("Failed to construct curve group")?;
-        let x = BigNum::from_slice(x_coord).context("Failed to create x coord")?;
-        let y = BigNum::from_slice(y_coord).context("Failed to create y coord")?;
-        let key = EcKey::from_public_key_affine_coordinates(&group, &x, &y)
-            .context("Failed to create EC public key")?;
-        PKey::from_ec_key(key).context("Failed to create PKey")
-    }
-
-    pub(super) fn algorithm(&self) -> Algorithm {
-        match self.kind {
-            Kind::Ed25519 => Algorithm::Assigned(iana::Algorithm::EdDSA),
-            Kind::Ec(EcKind::P256) => Algorithm::Assigned(iana::Algorithm::ES256),
-            Kind::Ec(EcKind::P384) => Algorithm::Assigned(iana::Algorithm::ES384),
-        }
-    }
-
-    fn verify_ed25519(&self, signature: &[u8], message: &[u8]) -> Result<bool> {
-        ensure!(signature.len() == 64, "Wrong signature length: {:?}", signature.len());
-        let mut verifier =
-            Verifier::new_without_digest(&self.pkey).context("Failed to create verifier")?;
-        verifier.verify_oneshot(signature, message).context("Failed to verify signature")
-    }
-
-    fn verify_ec(&self, ec: EcKind, signature: &[u8], message: &[u8]) -> Result<bool> {
-        let (coord_len, digest) = match ec {
-            EcKind::P256 => (32, MessageDigest::sha256()),
-            EcKind::P384 => (48, MessageDigest::sha384()),
-        };
-        let sig_len = coord_len * 2;
-        ensure!(signature.len() == sig_len, "Unexpected signature length: {:?}", signature.len());
-        // Convert the signature from raw to DER format.
-        let (r, s) = signature.split_at(coord_len);
-        let r = BigNum::from_slice(r).context("Failed to create BigNum for r")?;
-        let s = BigNum::from_slice(s).context("Failed to create BigNum for s")?;
-        let signature =
-            EcdsaSig::from_private_components(r, s).context("Failed to create ECDSA signature")?;
-        let signature = signature.to_der().context("Failed to DER encode signature")?;
-        // Verify the signature against the message.
-        let mut verifier =
-            Verifier::new(digest, &self.pkey).context("Failed to create verifier")?;
-        verifier.verify_oneshot(&signature, message).context("Failed to verify signature")
+    pub(crate) fn pkey(&self) -> &PKeyRef<Public> {
+        &self.pkey
     }
 
     /// Verify that the signature obtained from signing the given message
     /// with the PublicKey matches the signature provided.
     pub fn verify(&self, signature: &[u8], message: &[u8]) -> Result<()> {
-        let verified = match self.kind {
-            Kind::Ed25519 => self.verify_ed25519(signature, message)?,
-            Kind::Ec(ec) => self
-                .verify_ec(ec, signature, message)
-                .with_context(|| format!("Failed to verify EC {:?} signature", ec))?,
-        };
+        let mut verifier = match self.kind {
+            Kind::Ed25519 => Verifier::new_without_digest(&self.pkey),
+            Kind::Ec(ec) => Verifier::new(digest_for_ec(ec), &self.pkey),
+        }
+        .with_context(|| format!("Failed to create verifier {:?}", self.kind))?;
+        let verified =
+            verifier.verify_oneshot(signature, message).context("Failed to verify signature")?;
         ensure!(verified, "Signature verification failed.");
         Ok(())
     }
@@ -180,16 +74,27 @@ impl TryFrom<PKey<Public>> for PublicKey {
     type Error = TryFromPKeyError;
 
     fn try_from(pkey: PKey<Public>) -> Result<Self, Self::Error> {
-        let kind = match pkey.id() {
-            Id::ED25519 => Kind::Ed25519,
-            Id::EC => match pkey.ec_key().unwrap().group().curve_name() {
-                Some(Nid::X9_62_PRIME256V1) => Kind::Ec(EcKind::P256),
-                Some(Nid::SECP384R1) => Kind::Ec(EcKind::P384),
-                _ => return Err(TryFromPKeyError(())),
-            },
-            _ => return Err(TryFromPKeyError(())),
-        };
+        let kind = pkey_kind(&pkey).ok_or(TryFromPKeyError(()))?;
         Ok(Self { kind, pkey })
+    }
+}
+
+fn pkey_kind<T: HasParams>(pkey: &PKeyRef<T>) -> Option<Kind> {
+    match pkey.id() {
+        Id::ED25519 => Some(Kind::Ed25519),
+        Id::EC => match pkey.ec_key().unwrap().group().curve_name() {
+            Some(Nid::X9_62_PRIME256V1) => Some(Kind::Ec(EcKind::P256)),
+            Some(Nid::SECP384R1) => Some(Kind::Ec(EcKind::P384)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn digest_for_ec(ec: EcKind) -> MessageDigest {
+    match ec {
+        EcKind::P256 => MessageDigest::sha256(),
+        EcKind::P384 => MessageDigest::sha384(),
     }
 }
 
@@ -240,6 +145,36 @@ mod tests {
 pub(crate) mod testkeys {
     use super::*;
     use openssl::pkey::Private;
+    use openssl::sign::Signer;
+
+    pub struct PrivateKey {
+        kind: Kind,
+        pkey: PKey<Private>,
+    }
+
+    impl PrivateKey {
+        pub fn from_pem(pem: &str) -> Self {
+            let pkey = PKey::private_key_from_pem(pem.as_bytes()).unwrap();
+            let kind = pkey_kind(&pkey).expect("unsupported private key");
+            Self { kind, pkey }
+        }
+
+        pub(crate) fn kind(&self) -> Kind {
+            self.kind
+        }
+
+        pub fn public_key(&self) -> PublicKey {
+            public_from_private(&self.pkey).try_into().unwrap()
+        }
+
+        pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
+            let mut signer = match self.kind {
+                Kind::Ed25519 => Signer::new_without_digest(&self.pkey)?,
+                Kind::Ec(ec) => Signer::new(digest_for_ec(ec), &self.pkey)?,
+            };
+            signer.sign_oneshot_to_vec(message).context("signing message")
+        }
+    }
 
     /// Gives the public key that matches the private key.
     pub fn public_from_private(pkey: &PKey<Private>) -> PKey<Public> {
@@ -253,11 +188,28 @@ pub(crate) mod testkeys {
         -----END PRIVATE KEY-----\n"];
 
     /// A selection of elliptic curve P-256 private keys.
-    pub const P256_KEY_PEM: &[&str] = &["-----BEGIN PRIVATE KEY-----\n\
+    pub const P256_KEY_PEM: &[&str] = &[
+        "-----BEGIN PRIVATE KEY-----\n\
         MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg+CO3ZBuAsimwPKAL\n\
         IeDyCh4cRZ5EMd6llGu5MQCpibGhRANCAAQObPxc4bIPjupILrvKJjTrpTcyCf6q\n\
         V552FlS67fGphwhg2LDfQ8adEdkuRfQvk+IvKJz8MDcPjErBG3Wlps1N\n\
-        -----END PRIVATE KEY-----\n"];
+        -----END PRIVATE KEY-----\n",
+        "-----BEGIN PRIVATE KEY-----\n\
+        MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgw1OPIcfQv5twO68B\n\
+        H+xNstW3DLXC6e4PGEYG/VppYVahRANCAAQMyWyv4ffVMu+wVNhNEk2mQSaTmSl/\n\
+        dLdRbEowfqPwMzdqdQ3QlKSV4ZcU2lsJEuQMkZzmVPz02enY2qcKctmj\n\
+        -----END PRIVATE KEY-----\n",
+        "-----BEGIN PRIVATE KEY-----\n\
+        MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgbXO6ee7i7sY4YfFS\n\
+        Gn60ScPuL3QuYFMX4nJbcqPSQ7+hRANCAAS8i9xA8cIcWStbMG97YrttQsYEIR2a\n\
+        15+alxbb6b7422FuxBB0qG5nJ4m+Jd3Bp+N2lwx4rHBFDqU4cp8VlQav\n\
+        -----END PRIVATE KEY-----\n",
+        "-----BEGIN PRIVATE KEY-----\n\
+        MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg/JuxkbpPyyouat11\n\
+        szDR+OA7d/fuMk9IhGkH7z1xHzChRANCAASRlY0D7Uh5T/FmB6txGr21w6jqKW2x\n\
+        RXdsaZgCB6XnrXlkgkvuWDc0CTLSBWdPFgW6OX0fyXViglEBH95REyQr\n\
+        -----END PRIVATE KEY-----\n",
+    ];
 
     /// A selection of elliptic curve P-384 private keys.
     pub const P384_KEY_PEM: &[&str] = &["-----BEGIN PRIVATE KEY-----\n\

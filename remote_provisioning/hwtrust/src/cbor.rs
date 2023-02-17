@@ -1,32 +1,33 @@
-//! The cert validator library provides validation functions for the CBOR-CDDL
-//! based certificate request, allowing validation of BCC certificate chain.
+//! Handling for data represented as CBOR. Cryptographic objects are encoded following COSE.
 
-pub mod bcc;
-pub mod dice;
-mod display;
-pub mod publickey;
+mod dice;
+mod publickey;
 
 use ciborium::{de::from_reader, value::Value};
 use std::io::Read;
 
-type CiboriumError = ciborium::de::Error<std::io::Error>;
-
-/// Reads the provided binary cbor-encoded file and returns a
-/// ciborium::Value struct wrapped in Result.
-pub fn value_from_file(fname: &str) -> Result<Value, CiboriumError> {
-    let bytes = std::fs::read(fname)?;
-    value_from_bytes(&bytes)
+fn cose_error(ce: coset::CoseError) -> anyhow::Error {
+    anyhow::anyhow!("CoseError: {:?}", ce)
 }
+
+type CiboriumError = ciborium::de::Error<std::io::Error>;
 
 /// Decodes the provided binary CBOR-encoded value and returns a
 /// ciborium::Value struct wrapped in Result.
-pub fn value_from_bytes(mut bytes: &[u8]) -> Result<Value, CiboriumError> {
+fn value_from_bytes(mut bytes: &[u8]) -> Result<Value, CiboriumError> {
     let value = from_reader(bytes.by_ref())?;
     // Ciborium tries to read one Value, but doesn't care if there is trailing data. We do.
     if !bytes.is_empty() {
         return Err(CiboriumError::Semantic(Some(0), "unexpected trailing data".to_string()));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+fn serialize(value: Value) -> Vec<u8> {
+    let mut data = Vec::new();
+    ciborium::ser::into_writer(&value, &mut data).unwrap();
+    data
 }
 
 #[cfg(test)]
