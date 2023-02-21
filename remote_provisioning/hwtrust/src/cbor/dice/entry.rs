@@ -2,9 +2,9 @@ use super::field_value::FieldValue;
 use crate::cbor::{cose_error, value_from_bytes};
 use crate::dice::{ConfigDesc, ConfigDescBuilder, DiceMode, Payload, PayloadBuilder};
 use crate::publickey::PublicKey;
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use ciborium::value::Value;
-use coset::{Algorithm, AsCborValue, CborSerializable, CoseKey, CoseSign1, Header};
+use coset::{AsCborValue, CborSerializable, CoseKey, CoseSign1};
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
 
@@ -20,6 +20,8 @@ const MODE: i64 = -4670551;
 const SUBJECT_PUBLIC_KEY: i64 = -4670552;
 const KEY_USAGE: i64 = -4670553;
 
+const CONFIG_DESC_RESERVED_MAX: i64 = -70000;
+const CONFIG_DESC_RESERVED_MIN: i64 = -70999;
 const COMPONENT_NAME: i64 = -70002;
 const COMPONENT_VERSION: i64 = -70003;
 const RESETTABLE: i64 = -70004;
@@ -33,12 +35,7 @@ impl Entry {
         let sign1 = CoseSign1::from_cbor_value(cbor)
             .map_err(cose_error)
             .context("Given CBOR does not appear to be a COSE_sign1")?;
-        let algorithm = Algorithm::Assigned(key.iana_algorithm());
-        check_protected_header(&algorithm, &sign1.protected.header)
-            .context("Validation of bcc entry protected header failed.")?;
-        sign1
-            .verify_signature(b"", |s, m| key.verify(s, m))
-            .context("public key cannot verify cose_sign1 cert")?;
+        key.verify_cose_sign1(&sign1).context("cannot verify COSE_sign1")?;
         match sign1.payload {
             None => bail!("Missing payload"),
             Some(payload) => Ok(Self { payload }),
@@ -48,17 +45,6 @@ impl Entry {
     pub(super) fn payload(&self) -> &[u8] {
         &self.payload
     }
-}
-
-/// Validate the protected header of a bcc entry with respect to the provided
-/// alg (typically originating from the subject public key of the payload).
-fn check_protected_header(alg: &Algorithm, header: &Header) -> Result<()> {
-    ensure!(
-        header.alg.as_ref() == Some(alg),
-        "Protected 'alg' header doesn't have the expected algorithm"
-    );
-    ensure!(header.crit.is_empty(), "No critical header values may be defined in the BCC");
-    Ok(())
 }
 
 impl Payload {
@@ -215,6 +201,9 @@ fn config_desc_from_slice(bytes: &[u8]) -> Result<ConfigDesc> {
                     component_version.set(value).context("Error setting component version")?
                 }
                 RESETTABLE => resettable.set(value).context("Error setting resettable")?,
+                key if (CONFIG_DESC_RESERVED_MIN..=CONFIG_DESC_RESERVED_MAX).contains(&key) => {
+                    bail!("Reserved key {}", key);
+                }
                 _ => match extensions.entry(key) {
                     Vacant(entry) => {
                         entry.insert(value);
@@ -239,22 +228,212 @@ fn config_desc_from_slice(bytes: &[u8]) -> Result<ConfigDesc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
-    use coset::{iana, Header, Label, RegisteredLabel};
+    use crate::cbor::serialize;
+    use crate::publickey::testkeys::{PrivateKey, ED25519_KEY_PEM};
+    use ciborium::cbor;
+    use coset::CborSerializable;
+    use std::collections::HashMap;
+
+    impl Entry {
+        pub(in super::super) fn from_payload(payload: &Payload) -> Result<Self> {
+            Ok(Self { payload: serialize(payload.to_cbor_value()?) })
+        }
+
+        pub(in super::super) fn sign(self, key: &PrivateKey) -> CoseSign1 {
+            key.sign_cose_sign1(self.payload)
+        }
+    }
+
+    impl Payload {
+        pub(in super::super) fn to_cbor_value(&self) -> Result<Value> {
+            let subject_public_key =
+                self.subject_public_key().to_cose_key()?.to_vec().map_err(cose_error)?;
+            let config_desc = serialize(encode_config_desc(self.config_desc()));
+            let mut map = vec![
+                (Value::from(ISS), Value::from(self.issuer())),
+                (Value::from(SUB), Value::from(self.subject())),
+                (Value::from(SUBJECT_PUBLIC_KEY), Value::from(subject_public_key)),
+                (Value::from(MODE), encode_mode(self.mode())),
+                (Value::from(CODE_HASH), Value::from(self.code_hash())),
+                (Value::from(CONFIG_DESC), Value::from(config_desc)),
+                (Value::from(AUTHORITY_HASH), Value::from(self.authority_hash())),
+                (Value::from(KEY_USAGE), Value::from(vec![0x20])),
+            ];
+            if let Some(code_desc) = self.code_desc() {
+                map.push((Value::from(CODE_DESC), Value::from(code_desc)));
+            }
+            if let Some(config_hash) = self.config_hash() {
+                map.push((Value::from(CONFIG_HASH), Value::from(config_hash)));
+            }
+            if let Some(authority_desc) = self.authority_desc() {
+                map.push((Value::from(AUTHORITY_DESC), Value::from(authority_desc)));
+            }
+            Ok(Value::Map(map))
+        }
+    }
+
+    fn encode_mode(mode: DiceMode) -> Value {
+        let mode = match mode {
+            DiceMode::NotConfigured => 0,
+            DiceMode::Normal => 1,
+            DiceMode::Debug => 2,
+            DiceMode::Recovery => 3,
+        };
+        Value::Bytes(vec![mode])
+    }
+
+    fn encode_config_desc(config_desc: &ConfigDesc) -> Value {
+        let mut map = Vec::new();
+        if let Some(component_name) = config_desc.component_name() {
+            map.push((Value::from(COMPONENT_NAME), Value::from(component_name)));
+        }
+        if let Some(component_version) = config_desc.component_version() {
+            map.push((Value::from(COMPONENT_VERSION), Value::from(component_version)));
+        }
+        if config_desc.resettable() {
+            map.push((Value::from(RESETTABLE), Value::Null));
+        }
+        Value::Map(map)
+    }
 
     #[test]
-    fn check_bcc_entry_protected_header() -> Result<()> {
-        let eddsa = coset::Algorithm::Assigned(iana::Algorithm::EdDSA);
-        let header = Header { alg: Some(eddsa.clone()), ..Default::default() };
-        check_protected_header(&eddsa, &header).context("Only alg allowed")?;
-        let header = Header { alg: Some(coset::Algorithm::PrivateUse(1000)), ..Default::default() };
-        assert!(check_protected_header(&eddsa, &header).is_err());
-        let mut header = Header { alg: Some(eddsa.clone()), ..Default::default() };
-        header.rest.push((Label::Int(1000), Value::from(2000u16)));
-        check_protected_header(&eddsa, &header).context("non-crit header allowed")?;
-        let mut header = Header { alg: Some(eddsa.clone()), ..Default::default() };
-        header.crit.push(RegisteredLabel::Assigned(iana::HeaderParameter::CounterSignature));
-        assert!(check_protected_header(&eddsa, &header).is_err());
-        Ok(())
+    fn valid_payload() {
+        payload_from_fields(valid_payload_fields()).unwrap();
+    }
+
+    #[test]
+    fn key_usage_only_key_cert_sign() {
+        let mut fields = valid_payload_fields();
+        fields.insert(KEY_USAGE, Value::Bytes(vec![0x20]));
+        payload_from_fields(fields).unwrap();
+    }
+
+    #[test]
+    fn key_usage_too_long() {
+        let mut fields = valid_payload_fields();
+        fields.insert(KEY_USAGE, Value::Bytes(vec![0x20, 0x30, 0x40]));
+        assert!(payload_from_fields(fields).is_err());
+    }
+
+    #[test]
+    fn key_usage_lacks_key_cert_sign() {
+        let mut fields = valid_payload_fields();
+        fields.insert(KEY_USAGE, Value::Bytes(vec![0x10]));
+        assert!(payload_from_fields(fields).is_err());
+    }
+
+    #[test]
+    fn key_usage_not_just_key_cert_sign() {
+        let mut fields = valid_payload_fields();
+        fields.insert(KEY_USAGE, Value::Bytes(vec![0x21]));
+        assert!(payload_from_fields(fields).is_err());
+    }
+
+    #[test]
+    fn mode_not_configured() {
+        let mut fields = valid_payload_fields();
+        fields.insert(MODE, Value::Bytes(vec![0]));
+        let payload = payload_from_fields(fields).unwrap();
+        assert_eq!(payload.mode(), DiceMode::NotConfigured);
+    }
+
+    #[test]
+    fn mode_normal() {
+        let mut fields = valid_payload_fields();
+        fields.insert(MODE, Value::Bytes(vec![1]));
+        let payload = payload_from_fields(fields).unwrap();
+        assert_eq!(payload.mode(), DiceMode::Normal);
+    }
+
+    #[test]
+    fn mode_debug() {
+        let mut fields = valid_payload_fields();
+        fields.insert(MODE, Value::Bytes(vec![2]));
+        let payload = payload_from_fields(fields).unwrap();
+        assert_eq!(payload.mode(), DiceMode::Debug);
+    }
+
+    #[test]
+    fn mode_recovery() {
+        let mut fields = valid_payload_fields();
+        fields.insert(MODE, Value::Bytes(vec![3]));
+        let payload = payload_from_fields(fields).unwrap();
+        assert_eq!(payload.mode(), DiceMode::Recovery);
+    }
+
+    #[test]
+    fn mode_invalid_becomes_not_configured() {
+        let mut fields = valid_payload_fields();
+        fields.insert(MODE, Value::Bytes(vec![4]));
+        let payload = payload_from_fields(fields).unwrap();
+        assert_eq!(payload.mode(), DiceMode::NotConfigured);
+    }
+
+    #[test]
+    fn mode_multiple_bytes() {
+        let mut fields = valid_payload_fields();
+        fields.insert(MODE, Value::Bytes(vec![0, 1]));
+        assert!(payload_from_fields(fields).is_err());
+    }
+
+    #[test]
+    fn subject_public_key_garbage() {
+        let mut fields = valid_payload_fields();
+        fields.insert(SUBJECT_PUBLIC_KEY, Value::Bytes(vec![17; 64]));
+        assert!(payload_from_fields(fields).is_err());
+    }
+
+    #[test]
+    fn config_desc_custom_field_above() {
+        let mut fields = valid_payload_fields();
+        let config_desc = serialize(cbor!({-69999 => "custom"}).unwrap());
+        fields.insert(CONFIG_DESC, Value::Bytes(config_desc));
+        payload_from_fields(fields).unwrap();
+    }
+
+    #[test]
+    fn config_desc_reserved_field_max() {
+        let mut fields = valid_payload_fields();
+        let config_desc = serialize(cbor!({-70000 => "reserved"}).unwrap());
+        fields.insert(CONFIG_DESC, Value::Bytes(config_desc));
+        payload_from_fields(fields).unwrap_err();
+    }
+
+    #[test]
+    fn config_desc_reserved_field_min() {
+        let mut fields = valid_payload_fields();
+        let config_desc = serialize(cbor!({-70999 => "reserved"}).unwrap());
+        fields.insert(CONFIG_DESC, Value::Bytes(config_desc));
+        payload_from_fields(fields).unwrap_err();
+    }
+
+    #[test]
+    fn config_desc_custom_field_below() {
+        let mut fields = valid_payload_fields();
+        let config_desc = serialize(cbor!({-71000 => "custom"}).unwrap());
+        fields.insert(CONFIG_DESC, Value::Bytes(config_desc));
+        payload_from_fields(fields).unwrap();
+    }
+
+    fn valid_payload_fields() -> HashMap<i64, Value> {
+        let key = PrivateKey::from_pem(ED25519_KEY_PEM[0]).public_key();
+        let subject_public_key = key.to_cose_key().unwrap().to_vec().unwrap();
+        let config_desc = serialize(cbor!({COMPONENT_NAME => "component name"}).unwrap());
+        HashMap::from([
+            (ISS, Value::from("issuer")),
+            (SUB, Value::from("subject")),
+            (SUBJECT_PUBLIC_KEY, Value::Bytes(subject_public_key)),
+            (KEY_USAGE, Value::Bytes(vec![0x20])),
+            (CODE_HASH, Value::Bytes(vec![1; 64])),
+            (CONFIG_DESC, Value::Bytes(config_desc)),
+            (AUTHORITY_HASH, Value::Bytes(vec![2; 64])),
+            (MODE, Value::Bytes(vec![0])),
+        ])
+    }
+
+    fn payload_from_fields(mut fields: HashMap<i64, Value>) -> Result<Payload> {
+        let value = Value::Map(fields.drain().map(|(k, v)| (Value::from(k), v)).collect());
+        let cbor = serialize(value);
+        Payload::from_cbor(&cbor)
     }
 }
