@@ -69,10 +69,9 @@ impl DeviceInfo {
 
         ensure!(
             device_info_range.contains(parsed_version),
-            concat!(
-                "Expected DeviceInfo version range: {device_info_range:?} does not match parsed",
-                " version: {parsed_version:?}"
-            ),
+            "Expected DeviceInfo version range: {:?} does not match parsed version: {:?}",
+            device_info_range,
+            parsed_version
         );
 
         let fused = match parsed_version {
@@ -226,7 +225,7 @@ impl DeviceInfo {
             "security_level must be a valid production value"
         );
         ensure!(
-            self.vbmeta_digest.as_ref().map_or(true, |d| !d.iter().all(|b| *b == 0u8)),
+            self.vbmeta_digest.as_ref().is_none_or(|d| !d.iter().all(|b| *b == 0u8)),
             "vbmeta_digest must not be all zeros. Got {:?}",
             self.vbmeta_digest
         );

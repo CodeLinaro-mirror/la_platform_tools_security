@@ -43,6 +43,15 @@ fn factory_csr_multiple_valid_csrs_succeeds() {
 }
 
 #[test]
+fn factory_csr_widevine_v19_profile_succeeds() {
+    let output = Command::new(hwtrust_bin())
+        .args(["factory-csr", "testdata/factory_csr/widevine_v19_profile_csr.json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
+
+#[test]
 fn factory_csr_one_invalid_csr_of_multiple_fails() {
     let output = Command::new(hwtrust_bin())
         .args(["factory-csr", "testdata/factory_csr/all_versions_invalid.json"])
@@ -62,5 +71,35 @@ fn exit_code_for_good_csr() {
 fn exit_code_for_bad_csr() {
     let output =
         Command::new(hwtrust_bin()).args(["csr", "testdata/csr/bad_csr.cbor"]).output().unwrap();
+    assert!(!output.status.success());
+}
+
+#[test]
+fn exit_code_for_good_chain_with_uds_certs() {
+    let output = Command::new(hwtrust_bin())
+        .args([
+            "dice-chain",
+            "testdata/dice/v3_p256_valid_with_uds_certs.chain",
+            "--uds-certs",
+            "testdata/uds/v3_p256_valid_with_uds_certs.uds.0",
+            "testdata/uds/v3_p256_valid_with_uds_certs.uds.1",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
+
+#[test]
+fn exit_code_for_mismatched_chain_with_uds_certs() {
+    let output = Command::new(hwtrust_bin())
+        .args([
+            "dice-chain",
+            "testdata/dice/v3_p256_mismatched_uds_certs.chain",
+            "--uds-certs",
+            "testdata/uds/v3_p256_mismatched_uds_certs.uds.0",
+            "testdata/uds/v3_p256_mismatched_uds_certs.uds.1",
+        ])
+        .output()
+        .unwrap();
     assert!(!output.status.success());
 }
