@@ -32,10 +32,6 @@ mod ffi {
         Vsr15,
         /// The DICE chain specified by VSR 16.
         Vsr16,
-        /// The DICE chain specified by VSR 17.
-        Vsr17,
-        /// The DICE chain specified by VSR 18.
-        Vsr18,
     }
 
     /// The result type used by [`verify_dice_chain()`]. The standard [`Result`] is currently only
@@ -135,7 +131,7 @@ mod ffi {
         fn compare_challenge_in_csr(csr: &Csr, challenge: &[u8]) -> BoolResult;
 
         #[cxx_name = countTrailingRkpVmMarkers]
-        fn count_trailing_rkp_vm_markers(chain: &DiceChain, instance: &str) -> IntResult;
+        fn count_trailing_rkp_vm_markers(chain: &DiceChain) -> IntResult;
     }
 }
 
@@ -148,8 +144,6 @@ impl TryInto<Options> for ffi::DiceChainKind {
             ffi::DiceChainKind::Vsr14 => Ok(Options::vsr14()),
             ffi::DiceChainKind::Vsr15 => Ok(Options::vsr15()),
             ffi::DiceChainKind::Vsr16 => Ok(Options::vsr16()),
-            ffi::DiceChainKind::Vsr17 => Ok(Options::vsr17()),
-            ffi::DiceChainKind::Vsr18 => Ok(Options::vsr18()),
             _ => Err("invalid chain kind".to_string()),
         }
     }
@@ -377,13 +371,10 @@ fn compare_challenge_in_csr(csr: &Csr, challenge: &[u8]) -> ffi::BoolResult {
     }
 }
 
-fn count_trailing_rkp_vm_markers(chain: &DiceChain, instance: &str) -> ffi::IntResult {
-    let Ok(rkp_instance) = RkpInstance::from_str(instance) else {
-        return ffi::IntResult { error: format!("invalid RKP instance: {instance}"), value: 0 };
-    };
+fn count_trailing_rkp_vm_markers(chain: &DiceChain) -> ffi::IntResult {
     match &chain.0 {
         Some(ChainForm::Proper(proper_chain)) => {
-            match proper_chain.count_trailing_rkp_vm_markers(rkp_instance) {
+            match proper_chain.count_trailing_rkp_vm_markers() {
                 Ok(marker_state) => match marker_state {
                     TrailingRkpVmMarker::None => ffi::IntResult { error: "".to_string(), value: 0 },
                     TrailingRkpVmMarker::ContinuousToLeaf(count) => {

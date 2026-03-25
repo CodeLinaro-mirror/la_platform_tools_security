@@ -4,9 +4,7 @@ use crate::publickey::{EcKind, KeyAgreementPublicKey, PublicKey, SignatureKind};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use coset::cbor::value::Value;
 use coset::iana::{self, EnumI64};
-use coset::{
-    Algorithm, CoseKey, CoseKeyBuilder, CoseSign1, KeyOperation, KeyType, Label, MlDsaVariant,
-};
+use coset::{Algorithm, CoseKey, CoseKeyBuilder, CoseSign1, KeyOperation, KeyType, Label};
 use foreign_types::ForeignType;
 use openssl::bn::{BigNum, BigNumContext};
 use openssl::ec::{EcGroup, EcKey};
@@ -84,16 +82,6 @@ impl PublicKey {
                 let x = adjust_coord(x.to_vec(), coord_len)?;
                 let y = adjust_coord(y.to_vec(), coord_len)?;
                 CoseKeyBuilder::new_ec2_pub_key(crv, x, y)
-            }
-            SignatureKind::MlDsa65 => {
-                let pub_key =
-                    self.pkey().raw_public_key().context("Get ML-DSA-65 raw public key")?;
-                CoseKeyBuilder::new_mldsa_pub_key(MlDsaVariant::MlDsa65, pub_key.to_vec())
-            }
-            SignatureKind::MlDsa87 => {
-                let pub_key =
-                    self.pkey().raw_public_key().context("Get ML-DSA-87 raw public key")?;
-                CoseKeyBuilder::new_mldsa_pub_key(MlDsaVariant::MlDsa87, pub_key.to_vec())
             }
         };
         Ok(builder
@@ -241,9 +229,6 @@ fn ensure_no_disallowed_labels(cose_key: &CoseKey) -> Result<()> {
         KeyType::Assigned(iana::KeyType::OKP) => {
             HashSet::from([iana::OkpKeyParameter::Crv.to_i64(), iana::OkpKeyParameter::X.to_i64()])
         }
-        KeyType::Assigned(iana::KeyType::AKP) => {
-            HashSet::from([iana::AkpKeyParameter::Pub.to_i64()])
-        }
         _ => bail!("Invalid key type in COSE key"),
     };
 
@@ -289,7 +274,7 @@ fn get_label_value_as_bytes(key: &CoseKey, label: Label) -> Result<&[u8]> {
 }
 
 fn ec_cose_signature_to_der(kind: SignatureKind, signature: &[u8]) -> Result<Vec<u8>> {
-    let coord_len = ec_coord_len(kind)?;
+    let coord_len = ec_coord_len(kind);
     ensure!(signature.len() == coord_len * 2, "Unexpected signature length");
     let r = BigNum::from_slice(&signature[..coord_len]).context("Creating BigNum for r")?;
     let s = BigNum::from_slice(&signature[coord_len..]).context("Creating BigNum for s")?;
@@ -297,14 +282,13 @@ fn ec_cose_signature_to_der(kind: SignatureKind, signature: &[u8]) -> Result<Vec
     signature.to_der().context("Failed to DER encode signature")
 }
 
-fn ec_coord_len(kind: SignatureKind) -> Result<usize> {
+fn ec_coord_len(kind: SignatureKind) -> usize {
     match kind {
         SignatureKind::Ec(kind) => match kind {
-            EcKind::P256 => Ok(32),
-            EcKind::P384 => Ok(48),
+            EcKind::P256 => 32,
+            EcKind::P384 => 48,
         },
-        SignatureKind::Ed25519 => Ok(32),
-        _ => bail!("Unsupported signature kind: {:?}", kind),
+        SignatureKind::Ed25519 => 32,
     }
 }
 
@@ -313,8 +297,6 @@ fn iana_algorithm(kind: SignatureKind) -> iana::Algorithm {
         SignatureKind::Ed25519 => iana::Algorithm::EdDSA,
         SignatureKind::Ec(EcKind::P256) => iana::Algorithm::ES256,
         SignatureKind::Ec(EcKind::P384) => iana::Algorithm::ES384,
-        SignatureKind::MlDsa65 => iana::Algorithm::ML_DSA_65,
-        SignatureKind::MlDsa87 => iana::Algorithm::ML_DSA_87,
     }
 }
 
@@ -345,7 +327,7 @@ mod tests {
     }
 
     fn ec_der_signature_to_cose(kind: SignatureKind, signature: &[u8]) -> Vec<u8> {
-        let coord_len = ec_coord_len(kind).unwrap();
+        let coord_len = ec_coord_len(kind);
         let signature = EcdsaSig::from_der(signature).unwrap();
         let mut r = signature.r().to_vec_padded(coord_len.try_into().unwrap()).unwrap();
         let mut s = signature.s().to_vec_padded(coord_len.try_into().unwrap()).unwrap();
@@ -457,7 +439,7 @@ mod tests {
             let cose_key = key.to_cose_key().unwrap();
             let kind = key.kind();
             assert_eq!(kind, SignatureKind::Ed25519);
-            let expected_size = ec_coord_len(kind).unwrap();
+            let expected_size = ec_coord_len(kind);
             let x =
                 get_label_value_as_bytes(&cose_key, Label::Int(iana::OkpKeyParameter::X.to_i64()))
                     .unwrap();
@@ -480,10 +462,8 @@ mod tests {
                     curves.insert(inner);
                 }
                 SignatureKind::Ed25519 => panic!("signature kind should not be ED25519"),
-                SignatureKind::MlDsa65 => panic!("signature kind should not be MlDsa65"),
-                SignatureKind::MlDsa87 => panic!("signature kind should not be MlDsa87"),
             };
-            let expected_size = ec_coord_len(kind).unwrap();
+            let expected_size = ec_coord_len(kind);
             let x =
                 get_label_value_as_bytes(&cose_key, Label::Int(iana::Ec2KeyParameter::X.to_i64()))
                     .unwrap();

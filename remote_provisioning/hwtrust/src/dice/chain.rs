@@ -67,8 +67,8 @@ pub enum ValidationError {
     RepeatedSubject(usize, String),
     #[error("repeated key in payload {0}")]
     RepeatedKey(usize),
-    #[error("For {0:?} instance: Dice chain has discontinuous marker at the {1}th payload")]
-    RkpVmChainHasDiscontinuousMarker(RkpInstance, usize),
+    #[error("RKP VM chain has discontinuous marker at the {0}th payload")]
+    RkpVmChainHasDiscontinuousMarker(usize),
     #[error(
         "For AVF instance: Dice chain does not have enough RKP VM markers. \
          Minimal marker number:{RKPVM_CHAIN_MIN_MARKER_NUM}, actual marker number:{0}"
@@ -144,7 +144,7 @@ impl Chain {
         }
 
         let chain = Self { root_public_key, payloads };
-        let marker_state = chain.count_trailing_rkp_vm_markers(rkp_instance)?;
+        let marker_state = chain.count_trailing_rkp_vm_markers()?;
         if let RkpInstance::Avf = rkp_instance {
             Self::validate_rkp_vm_marker_in_avf_instance(&marker_state)?;
         }
@@ -199,10 +199,7 @@ impl Chain {
     ///   leaf certificate (i.e., the sequence breaks before the end).
     /// * `Err(ValidationError::RkpVmChainHasDiscontinuousMarker)`: If a non-marker is found
     ///   *between* RKP VM markers, indicating a broken sequence.
-    pub fn count_trailing_rkp_vm_markers(
-        &self,
-        rkp_instance: RkpInstance,
-    ) -> Result<TrailingRkpVmMarker, ValidationError> {
+    pub fn count_trailing_rkp_vm_markers(&self) -> Result<TrailingRkpVmMarker, ValidationError> {
         let Some(start_idx) = self.payloads.iter().position(|p| p.has_rkpvm_marker()) else {
             return Ok(TrailingRkpVmMarker::None);
         };
@@ -213,7 +210,7 @@ impl Chain {
         for (i, payload) in self.payloads.iter().enumerate().skip(start_idx) {
             if payload.has_rkpvm_marker() {
                 if seen_non_marker {
-                    return Err(ValidationError::RkpVmChainHasDiscontinuousMarker(rkp_instance, i));
+                    return Err(ValidationError::RkpVmChainHasDiscontinuousMarker(i));
                 }
                 rkpvm_marker_count += 1;
                 last_marker_idx = i;
@@ -460,7 +457,7 @@ mod tests {
             valid_payload(2, P256_KEY_PEM[3]).config_desc(config_desc.clone()).build().unwrap(),
         ];
         let err = Chain::validate(root_public_key, payloads, RkpInstance::Avf).unwrap_err();
-        assert_eq!(err, ValidationError::RkpVmChainHasDiscontinuousMarker(RkpInstance::Avf, 2));
+        assert_eq!(err, ValidationError::RkpVmChainHasDiscontinuousMarker(2));
     }
 
     #[test]
@@ -492,10 +489,7 @@ mod tests {
                 .unwrap(),
         ];
         let chain = Chain::validate(root_public_key, payloads, RkpInstance::Default).unwrap();
-        assert_eq!(
-            chain.count_trailing_rkp_vm_markers(RkpInstance::Default).unwrap(),
-            TrailingRkpVmMarker::None
-        );
+        assert_eq!(chain.count_trailing_rkp_vm_markers().unwrap(), TrailingRkpVmMarker::None);
     }
 
     #[test]
@@ -519,10 +513,7 @@ mod tests {
                 .unwrap(),
         ];
         let result = Chain::validate(root_public_key, payloads, RkpInstance::Default);
-        assert_eq!(
-            result.unwrap_err(),
-            ValidationError::RkpVmChainHasDiscontinuousMarker(RkpInstance::Default, 2)
-        );
+        assert_eq!(result.unwrap_err(), ValidationError::RkpVmChainHasDiscontinuousMarker(2));
     }
 
     #[test]
@@ -547,7 +538,7 @@ mod tests {
         ];
         let chain = Chain::validate(root_public_key, payloads, RkpInstance::Default).unwrap();
         assert_eq!(
-            chain.count_trailing_rkp_vm_markers(RkpInstance::Default).unwrap(),
+            chain.count_trailing_rkp_vm_markers().unwrap(),
             TrailingRkpVmMarker::ContinuousNotToLeaf
         );
     }
@@ -574,7 +565,7 @@ mod tests {
         ];
         let chain = Chain::validate(root_public_key, payloads, RkpInstance::Avf).unwrap();
         assert_eq!(
-            chain.count_trailing_rkp_vm_markers(RkpInstance::Avf).unwrap(),
+            chain.count_trailing_rkp_vm_markers().unwrap(),
             TrailingRkpVmMarker::ContinuousToLeaf(2)
         );
     }
@@ -600,7 +591,7 @@ mod tests {
         ];
         let chain = Chain::validate(root_public_key, payloads, RkpInstance::Avf).unwrap();
         assert_eq!(
-            chain.count_trailing_rkp_vm_markers(RkpInstance::Avf).unwrap(),
+            chain.count_trailing_rkp_vm_markers().unwrap(),
             TrailingRkpVmMarker::ContinuousToLeaf(3)
         );
     }
