@@ -1,5 +1,6 @@
 package {
     default_applicable_licenses: ["Android-Apache-2.0"],
+    default_team: "trendy_team_android_hardware_backed_security",
 }
 
 rust_defaults {
@@ -13,6 +14,7 @@ rust_defaults {
         "libciborium",
         "libclap",
         "libcoset",
+        "libforeign_types",
         "libhex",
         "libitertools",
         "libserde_json",
@@ -20,14 +22,20 @@ rust_defaults {
     ],
     target: {
         host: {
-            rlibs: ["libopenssl_static"],
+            rlibs: [
+                "libopenssl_static",
+                "libbssl_sys_static",
+            ],
             // dylib is disabled due to compile failure in libhwtrust. See b/373621186 for details.
             dylib: {
                 enabled: false,
             },
         },
         android: {
-            rustlibs: ["libopenssl"],
+            rustlibs: [
+                "libopenssl",
+                "libbssl_sys",
+            ],
         },
     },
 }
@@ -94,6 +102,23 @@ rust_test {
     data: [":testdata"],
     data_bins: ["hwtrust"],
     data_libs: ["libcrypto"],
+    compile_multilib: "first",
+}
+
+rust_test {
+    name: "hwtrust_boringssl_tests",
+    host_supported: true,
+    srcs: ["tests/hwtrust_boringssl_tests.rs"],
+    test_suites: ["general-tests"],
+    rustlibs: [
+        "libanyhow",
+        "libhwtrust",
+        "libciborium",
+        "libcrypto",
+        "libcoset",
+        "librand",
+        "libbssl_sys",
+    ],
     compile_multilib: "first",
 }
 
